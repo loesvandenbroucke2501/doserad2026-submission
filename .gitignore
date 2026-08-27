@@ -1,0 +1,8 @@
+test-data/
+example_algorithm*
+model.tar.gz
+
+.venv
+.vscode
+.DS_Store
+*.tar.gz

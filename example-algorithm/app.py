@@ -1,0 +1,117 @@
+"""
+The following is an example algorithm inference server.
+
+Any implementation will do as long as it:
+
+1. Starts the inference server and loads the algorithm
+2. On the health endpoint indicates if the server is healthy (i.e. returns HTTP 200 OK)
+3. On the invoke endpoint invokes the algorithm for inference and returns HTTP 201 CREATED
+
+"""
+from contextlib import asynccontextmanager
+from pathlib import Path
+
+from fastapi import FastAPI, Response, status
+import torch
+import uvicorn
+import os
+
+import inference
+
+
+from uvicorn.config import LOGGING_CONFIG
+
+
+def _show_torch_cuda_info():
+    print("=+=" * 10)
+    print("Collecting Torch CUDA information")
+    print(f"Torch CUDA is available: {(available := torch.cuda.is_available())}")
+    if available:
+        print(f"\tnumber of devices: {torch.cuda.device_count()}")
+        print(f"\tcurrent device: { (current_device := torch.cuda.current_device())}")
+        print(f"\tproperties: {torch.cuda.get_device_properties(current_device)}")
+    print("=+=" * 10)
+
+
+def init_model():
+    # Initialize your model: any way you'd like, here we show-case torch
+    _show_torch_cuda_info()
+
+    # Example how to set torch to use the GPU (if available)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    model = torch.nn.Linear(10, 1).to(device)
+
+    # Your model will be extracted to the `model_dir` at runtime on Grand Challenge
+    # Note: when testing locally, the local `./model` directory is mounted here.
+    # Eventually, you should upload it as a tarball to Grand Challenge!
+    # Go to Algorithm and upload it under Models.
+    model_dir = Path("/opt/ml/model")
+    with open(
+        model_dir / "a_tarball_subdirectory" / "some_tarball_resource.txt", "r"
+    ) as f:
+        print(f.read())
+
+    return model
+
+
+MODELS = {}
+
+
+# During the lifespan of your inference server, your model should be ready
+# for invocations.It is important to load your model here, and not just
+# before running inference, to allow the inference time to be as short as
+# possible. Each invocation will have a timeout, so if your model still
+# needs to be loaded when the /invoke endpoint is called, there may not be
+# enough time for processing.
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Load the ML model
+    MODELS["answer_to_everything"] = init_model()
+    yield
+    # Clean up the models and release the resources
+    MODELS.clear()
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+# After starting your inference server, the health endpoint will
+# be called repeatedly until it returns a 200 response.
+# Redirect responses will not be followed and will raise an exception.
+# Any other response will be ignored.
+@app.get("/health")
+async def health():
+    try:
+        # check if the model is initialized
+        _ = MODELS["answer_to_everything"]
+        return Response(status_code=status.HTTP_200_OK)
+    except KeyError:
+        return Response(status_code=status.HTTP_404_NOT_FOUND)
+
+
+# After the health endpoint returns a 200 response,
+# the invoke endpoint will be called (one or more times)
+# to invoke inference on the inputs in the input folder.
+# When inference is done, this endpoint should return a 201 response.
+# Any other response will raise an exception and fail.
+@app.post("/invoke")
+async def invoke():
+    # First print a tree of /input
+    for root, dirs, files in os.walk("/input"):
+        level = root.count(os.sep)
+        indent = "    " * level
+        print(f"{indent}{os.path.basename(root)}/")
+        subindent = "    " * (level + 1)
+        for f in files:
+            print(f"{subindent}{f}")
+
+    model = MODELS["answer_to_everything"]
+    inference.run(model)
+    return Response(status_code=status.HTTP_201_CREATED)
+
+
+if __name__ == "__main__":
+    log_config = LOGGING_CONFIG.copy()
+    log_config["handlers"]["default"]["stream"] = "ext://sys.stdout"
+    uvicorn.run(app, host="0.0.0.0", port=4743, log_config=log_config)
