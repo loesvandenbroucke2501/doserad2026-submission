@@ -35,7 +35,7 @@ INPUT_PATH = Path("/input")
 OUTPUT_PATH = Path("/output")
 RESOURCE_PATH = Path("resources")
 
-DEFAULT_TASK = "proton-ct"
+DEFAULT_TASK = "photon-ct"
 DOSE_SIMULATION = "gaussian"  # "zeros", "noise" or "gaussian"
 NUM_OUTPUT_FILES = 10
 
@@ -94,6 +94,8 @@ def run(model):
 
         # Every slice in a stack shares the same source image.
         input_image = load_input_by_index(slot[0]["input_file_idx"])
+
+        # hier moet denk ik mijn code komen
 
         print(
             f"Writing dummy dose stack for output file index {output_index + 1} "

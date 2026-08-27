@@ -49,6 +49,7 @@ def init_model():
     model_dir = Path("/opt/ml/model")
     with open(
         model_dir / "a_tarball_subdirectory" / "some_tarball_resource.txt", "r"
+        #model_dir / "model.pth"
     ) as f:
         print(f.read())
 
