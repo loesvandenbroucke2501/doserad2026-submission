@@ -93,10 +93,13 @@ def run(model):
             continue
 
         # Every slice in a stack shares the same source image.
-        input_image = load_input_by_index(slot[0]["input_file_idx"])
+        input_image = load_input_by_index(slot[0]["input_file_idx"]) # ct images (sitk Image)
+        ct_arr, ct_aff = convert_sitk_to_numpy(input_image) # ct images (numpy array, affine matrix)
 
-        # hier moet denk ik mijn code komen
+        ct_arr, ct_aff = preprocess_ct()
 
+
+        '''
         print(
             f"Writing dummy dose stack for output file index {output_index + 1} "
             f"with {stack_size} slices"
@@ -113,6 +116,7 @@ def run(model):
         stacked = sitk.JoinSeries(dose_slices)
         print(stacked.GetSize())
         sitk.WriteImage(stacked, output_dir / "output.mha", useCompression=False)
+        '''
 
     return 0
 
@@ -195,6 +199,59 @@ def load_input_by_index(input_file_idx):
         f"with shape {image.GetSize()} and spacing {image.GetSpacing()}"
     )
     return image
+
+def convert_sitk_to_numpy(sitk_img):
+    img_arr = sitk.GetArrayFromImage(sitk_img)
+
+    origin = np.array(sitk_img.GetOrigin())
+    spacing = np.array(sitk_img.GetSpacing())
+    direction = np.array(sitk_img.GetDirection()).reshape(3, 3)
+
+    img_aff = np.eye(4)
+    img_aff[0:3, 0:3] = direction @ np.diag(spacing)
+    img_aff[0:3, 3] = origin
+    return img_arr, img_aff
+
+def preprocess_ct(ct_arr, ct_aff):
+    ct_arr = ct_arr.transpose(2, 1, 0)
+    ct_arr, ct_aff = resize_image(ct_arr, ct_aff, target_shape=[256, 256, 112])
+    ct_arr = hu_to_ed(ct_arr)
+    return ct_arr.transpose(2, 1, 0)
+
+def resize_image(img_arr, img_aff, target_shape=[256, 256, 112]):
+    # around center
+
+    assert len(img_arr.shape) == 3, f"Expected 3D image array, got shape {img_arr.shape}"
+
+    aff = np.eye(4)
+    current_shape = img_arr.shape
+    difference = np.array(target_shape) - np.array(current_shape)
+
+    crop_start = np.maximum(-difference // 2, 0)
+    crop_end   = np.maximum(-difference - (-difference // 2), 0)  # remainder side
+    pad_start = np.maximum(difference // 2, 0)
+    pad_end   = np.maximum(difference - (difference // 2), 0)       # remainder side
+
+    img_arr = img_arr[crop_start[0]:current_shape[0]-crop_end[0], crop_start[1]:current_shape[1]-crop_end[1], crop_start[2]:current_shape[2]-crop_end[2]]
+    img_arr = np.pad(img_arr, ((pad_start[0], pad_end[0]), (pad_start[1], pad_end[1]), (pad_start[2], pad_end[2])), mode='constant', constant_values=0)
+
+    assert img_arr.shape == tuple(target_shape), f"Resized image shape {img_arr.shape} does not match target shape {target_shape}"
+
+    for i in range(3):
+        aff[i,i] = img_aff[i,i]
+        aff[i, 3] = img_aff[i, 3] - aff[i,i] * pad_start[i] + aff[i,i] * crop_start[i]
+
+    return img_arr, aff
+
+def hu_to_ed(ct_hu_arr):
+    with open('/DATASERVER/MIC/GENERAL/STAFF/lvdnbrz/DoseRAD2026/photon/training/beam_parameters.json', 'r') as f:
+        hu_ed_curve = json.load(f)['hu_to_density']['entries']
+
+    hu_values = [entry['hu'] for entry in hu_ed_curve]
+    density_values = [entry['density_g_cm3'] for entry in hu_ed_curve]
+
+    ct_ed_arr = np.interp(ct_hu_arr, hu_values, density_values)
+    return ct_ed_arr
 
 
 def make_zeros_dose(reference_image, device=None):
