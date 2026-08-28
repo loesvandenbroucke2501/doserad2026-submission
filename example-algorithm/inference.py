@@ -30,6 +30,10 @@ from pathlib import Path
 import numpy as np
 import SimpleITK as sitk
 import torch
+import torch.nn.functional as F 
+
+import matplotlib.pyplot as plt
+
 
 INPUT_PATH = Path("/input")
 OUTPUT_PATH = Path("/output")
@@ -58,7 +62,6 @@ if TASK not in TASK_CONFIG:
 
 INPUT_DIR_BASE, INPUT_JSON_NAME = TASK_CONFIG[TASK]
 
-
 def run(model):
     print(
         f"Running TASK {TASK!r} "
@@ -79,12 +82,13 @@ def run(model):
     print(f"Stack sizes: {stack_sizes}")
 
     for output_index in range(NUM_OUTPUT_FILES):
+        
         slot = per_output[output_index]
         stack_size = stack_sizes[output_index]
 
-        output_dir = OUTPUT_PATH / f"images/stacked-radiation-dose-map-{output_index + 1}"
+        output_dir = OUTPUT_PATH / f"images/stacked-radiation-dose-map-{output_index + 1}" # hier ziet je eigenlijk al in een bepaalde output slot
         os.makedirs(output_dir, exist_ok=True)
-
+    
         if stack_size == 0:
             # Empty stack: write a placeholder to honor the output contract.
             sitk.WriteImage(
@@ -95,10 +99,26 @@ def run(model):
         # Every slice in a stack shares the same source image.
         input_image = load_input_by_index(slot[0]["input_file_idx"]) # ct images (sitk Image)
         ct_arr, ct_aff = convert_sitk_to_numpy(input_image) # ct images (numpy array, affine matrix)
+        ct_arr, ct_aff = preprocess_ct(ct_arr, ct_aff)
 
-        ct_arr, ct_aff = preprocess_ct()
-
-
+        input_parameters = []
+        input_parameters_index = []
+        input_parameters_minimum_cutoff = []
+        for entry in metadata:
+                if entry["image_file_idx"] == slot[0]["input_file_idx"]:
+                    for beam_idx, beam in enumerate(entry["beams"]):
+                        for cp_idx, control_point in enumerate(beam["control_points"]):
+                            if control_point["output_info"]["output_file_idx"] == output_index:
+                                
+                                input_parameters.append(
+                                    project_mlc(entry, beam_idx, cp_idx, input_image)
+                                )            
+                                input_parameters_index.append(control_point["output_info"]["idx_in_output"])
+                                input_parameters_minimum_cutoff.append(control_point["output_info"]["minimum_cutoff"])
+        
+        for slice_index in range(stack_size):
+            ...
+       
         '''
         print(
             f"Writing dummy dose stack for output file index {output_index + 1} "
@@ -120,6 +140,185 @@ def run(model):
 
     return 0
 
+class MachineToPatientSpace:
+
+    def __init__(self,
+                 machine_pixel_size_mm = [1,1], # mm
+                 patient_pixel_size_mm = [2, 2, 2], # mm
+                 sad_mm = 1000, # mm
+                 ):
+        
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.scale_factor = [machine_pixel_size_mm[0] / patient_pixel_size_mm[0], machine_pixel_size_mm[1] / patient_pixel_size_mm[2]]
+        self.sad_mm = sad_mm
+
+        self.patient_pixel_size_mm = patient_pixel_size_mm
+        self.machine_pixel_size_mm = machine_pixel_size_mm  
+    
+    def _resample_mlc(self, tensor, scale_factors):
+        return torch.nn.functional.interpolate(tensor, scale_factor = scale_factors, mode = 'bilinear')
+
+    def _backproject_scaling(self, mlc_tensor, iso, target_shape):
+
+        mlc_volume = torch.zeros((1, 1, target_shape[0], target_shape[1], target_shape[2]), dtype=torch.float32).to(self.device)
+
+        grid_y, grid_x = torch.meshgrid(
+            torch.linspace(-1, 1, mlc_tensor.shape[2], device=self.device),
+            torch.linspace(-1, 1, mlc_tensor.shape[3], device=self.device),
+            indexing="ij"
+        )
+        grid = torch.stack((grid_x, grid_y), dim=-1)[None, ...]
+
+        for y in range(target_shape[1]):
+
+            backproject_distance_mm = (iso[1] - y) * self.patient_pixel_size_mm[1]             
+        
+            scaling_factor = 1 / ((self.sad_mm - backproject_distance_mm) / self.sad_mm)
+            scaled_grid = grid * scaling_factor            
+
+            mlc_projected = F.grid_sample(mlc_tensor, scaled_grid, mode='bilinear', align_corners=True)
+            mlc_projected = mlc_projected.unsqueeze(3) 
+
+            # padding (isocenter is in center of the mlc aperture)
+            pad_x_left = iso[0] - mlc_projected.shape[2] // 2
+            pad_x_right = target_shape[0] - iso[0] - mlc_projected.shape[2] // 2 - (mlc_projected.shape[2] % 2)
+
+            crop_x_left = 0
+            crop_x_right = 0
+            if pad_x_left < 0:
+                crop_x_left = - pad_x_left
+                pad_x_left = 0
+            if pad_x_right < 0:
+                crop_x_right = - pad_x_right
+                pad_x_right = 0
+
+            pad_y_left = y
+            pad_y_right = target_shape[1] - y - 1
+
+            pad_z_left = iso[2] - mlc_projected.shape[4] // 2
+            pad_z_right = target_shape[2] - iso[2] - mlc_projected.shape[4] // 2 - (mlc_projected.shape[4] % 2)
+
+            crop_z_left = 0
+            crop_z_right = 0
+            if pad_z_left < 0:
+                crop_z_left = - pad_z_left
+                pad_z_left = 0
+            if pad_z_right < 0:
+                crop_z_right = - pad_z_right
+                pad_z_right = 0
+
+            mlc_projected = F.pad(mlc_projected, (pad_z_left, pad_z_right, pad_y_left, pad_y_right, pad_x_left, pad_x_right), mode='constant', value=0)
+            mlc_projected = mlc_projected[:, :, crop_x_left:mlc_projected.shape[2]-crop_x_right, :, crop_z_left:mlc_projected.shape[4]-crop_z_right]
+
+            if y == 0:
+                mlc_volume = mlc_projected
+            else:
+                mlc_volume = mlc_volume + mlc_projected
+
+        return mlc_volume
+
+    @staticmethod
+    def _apply_gantry_rotation(tensor, angle, isocenter_coo):
+
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+        _, _, W, H, D = tensor.shape
+
+        # shift the tensor so that the isocenter is at the center of rotation
+        shifts = (
+            W // 2 - isocenter_coo[0],
+            H // 2 - isocenter_coo[1],
+            D // 2 - isocenter_coo[2],
+        )
+        tensor = torch.roll(tensor, shifts=shifts, dims=(2, 3, 4))
+    
+        # create the rotation matrix for the gantry rotation around the isocenter (which is now the center of the tensor)
+        angle_rad = torch.tensor(angle * np.pi / 180, dtype=torch.float32).to(device)
+        gantry_rotation_matrix = torch.tensor([
+                [1, 0, 0, 0],
+                [0, torch.cos(angle_rad), -torch.sin(angle_rad), 0],
+                [0, torch.sin(angle_rad), torch.cos(angle_rad), 0],
+                ], device=device, dtype=torch.float32)
+
+        gantry_rotation_matrix = gantry_rotation_matrix.unsqueeze(0).repeat(tensor.shape[0], 1, 1)
+        gantry_grid = F.affine_grid(gantry_rotation_matrix, tensor.shape, align_corners=False)
+        tensor = F.grid_sample(tensor, gantry_grid, mode='bilinear', align_corners=False)
+
+        # shift the tensor back to the original position
+        shifts = (
+            W // 2 + isocenter_coo[0],
+            H // 2 + isocenter_coo[1],
+            D // 2 + isocenter_coo[2],
+        )
+        tensor = torch.roll(tensor, shifts=shifts, dims=(2, 3, 4))
+ 
+        return tensor
+    
+    def process(self, mlc_aperture, gantry_angle, isocenter_wc, ct_arr, ct_aff):
+
+        iso = [int(np.round((isocenter_wc[i] - ct_aff[i, 3]) / ct_aff[i,i]))  for i in range(3)]
+
+        geo_enc = torch.zeros(ct_arr.shape, dtype = torch.float32).unsqueeze(0).unsqueeze(0).to(self.device)
+
+        mlc_aperture = torch.tensor(mlc_aperture, dtype=torch.float32).unsqueeze(0).unsqueeze(0).to(self.device)
+        
+        _, _, W, H, D = geo_enc.shape
+
+        mlc_aperture = self._resample_mlc(mlc_aperture, self.scale_factor)
+
+        geo_enc = self._backproject_scaling(mlc_aperture, iso, ct_arr.shape)
+    
+        geo_enc = self._apply_gantry_rotation(geo_enc, gantry_angle, iso)
+        geo_enc = geo_enc.squeeze().cpu().numpy()
+
+        body_mask = np.zeros_like(ct_arr, dtype=np.uint8)
+        body_mask[ct_arr != -1024] = 1
+
+        geo_enc = geo_enc * body_mask
+
+        return geo_enc 
+
+def project_mlc(beam_parameters, beam_idx, cp_idx, input_image):
+
+    ct_arr, ct_aff = convert_sitk_to_numpy(input_image)
+    ct_arr = ct_arr.transpose(2, 1, 0)  
+
+    leaf_thickness = 5 # mm
+    machine_pixel_size_mm = [1, 1] # mm
+    patient_pixel_size_mm = [2, 2, 2] # mm
+
+    num_leaf_pairs = len(beam_parameters["beams"][beam_idx]["control_points"][cp_idx]["mlc_left_int_mm"])
+    size_array_mm = (num_leaf_pairs * leaf_thickness, num_leaf_pairs * leaf_thickness) # mm
+    size_array_pixels = (int(size_array_mm[0] / machine_pixel_size_mm[0]), int(size_array_mm[1] / machine_pixel_size_mm[1])) # pixels
+
+    GeoEncoder = MachineToPatientSpace(
+            machine_pixel_size_mm = machine_pixel_size_mm,
+            patient_pixel_size_mm = patient_pixel_size_mm,
+            sad_mm = beam_parameters["beams"][beam_idx]["SAD_mm"]
+    )
+    iso_center = beam_parameters["beams"][beam_idx]["iso_center"]
+            
+    mlc_aperture = np.zeros((size_array_pixels[0], size_array_pixels[1]), dtype=np.uint8)
+    gantry_angle = beam_parameters["beams"][beam_idx]["control_points"][cp_idx]["gantry_angle"]
+
+    # mm
+    mlc_left = beam_parameters['beams'][beam_idx]['control_points'][cp_idx]['mlc_left_int_mm']
+    mlc_right = beam_parameters['beams'][beam_idx]['control_points'][cp_idx]['mlc_right_int_mm']
+    mlc_left = np.repeat(mlc_left, leaf_thickness / (size_array_mm[0] / size_array_pixels[0]))
+    mlc_right = np.repeat(mlc_right, leaf_thickness / (size_array_mm[0] / size_array_pixels[0]))
+    # mm to indices
+    mlc_left = np.round((mlc_left + (size_array_mm[0] / 2)) * (size_array_pixels[0] / size_array_mm[0]))
+    mlc_right = np.round((mlc_right + (size_array_mm[0] / 2)) * (size_array_pixels[0] / size_array_mm[0]))
+
+    for r_i in range(len(mlc_left)):
+        mlc_aperture[r_i, int(mlc_left[r_i]) : int(mlc_right[r_i])] = 1
+    mlc_aperture = mlc_aperture.T
+
+    geo_enc = GeoEncoder.process(mlc_aperture, gantry_angle, iso_center, ct_arr, ct_aff)
+    geo_enc, geo_enc_aff = resize_image(geo_enc, ct_aff)
+    geo_enc = geo_enc.transpose(2, 1, 0)            
+
+    return geo_enc, geo_enc_aff
 
 def simulate_dose(input_image, output_info, device):
     """Build one dummy dose slice and zero out everything below its cutoff."""
@@ -189,9 +388,11 @@ def load_sitk_image(location):
         return sitk.ReadImage(mha_files[0])
     else:
         raise FileNotFoundError("!!!")
+    
 
 @lru_cache(maxsize=1)
 def load_input_by_index(input_file_idx):
+    print('Input file index:', input_file_idx + 1)  
     location = INPUT_PATH / f"images/{INPUT_DIR_BASE}-{input_file_idx + 1}"
     image = load_sitk_image(location)
     print(
@@ -200,7 +401,9 @@ def load_input_by_index(input_file_idx):
     )
     return image
 
+
 def convert_sitk_to_numpy(sitk_img):
+    
     img_arr = sitk.GetArrayFromImage(sitk_img)
 
     origin = np.array(sitk_img.GetOrigin())
@@ -210,13 +413,27 @@ def convert_sitk_to_numpy(sitk_img):
     img_aff = np.eye(4)
     img_aff[0:3, 0:3] = direction @ np.diag(spacing)
     img_aff[0:3, 3] = origin
+    
     return img_arr, img_aff
+
+def convert_numpy_to_sitk(img_arr, img_aff):
+
+    sitk_img = sitk.GetImageFromArray(img_arr)
+
+    sitk_img.SetOrigin(img_aff[0:3, 3])
+    sitk_img.SetSpacing(np.linalg.norm(img_aff[0:3, 0:3], axis=0))
+    sitk_img.SetDirection((img_aff[0:3, 0] / np.linalg.norm(img_aff[0:3, 0])).tolist() + 
+                         (img_aff[0:3, 1] / np.linalg.norm(img_aff[0:3, 1])).tolist() + 
+                         (img_aff[0:3, 2] / np.linalg.norm(img_aff[0:3, 2])).tolist())
+    return sitk_img
+
 
 def preprocess_ct(ct_arr, ct_aff):
     ct_arr = ct_arr.transpose(2, 1, 0)
-    ct_arr, ct_aff = resize_image(ct_arr, ct_aff, target_shape=[256, 256, 112])
     ct_arr = hu_to_ed(ct_arr)
-    return ct_arr.transpose(2, 1, 0)
+    ct_arr, ct_aff = resize_image(ct_arr, ct_aff, target_shape=[256, 256, 112])
+    return np.transpose(ct_arr, (2, 1, 0)), ct_aff
+
 
 def resize_image(img_arr, img_aff, target_shape=[256, 256, 112]):
     # around center
@@ -243,12 +460,28 @@ def resize_image(img_arr, img_aff, target_shape=[256, 256, 112]):
 
     return img_arr, aff
 
-def hu_to_ed(ct_hu_arr):
-    with open('/DATASERVER/MIC/GENERAL/STAFF/lvdnbrz/DoseRAD2026/photon/training/beam_parameters.json', 'r') as f:
-        hu_ed_curve = json.load(f)['hu_to_density']['entries']
+def load_model(model_dir):
+    ...
 
-    hu_values = [entry['hu'] for entry in hu_ed_curve]
-    density_values = [entry['density_g_cm3'] for entry in hu_ed_curve]
+def hu_to_ed(ct_hu_arr):
+    
+    hu_ed_curve = {
+        "entries": [
+            {"hu": -1024, "density_g_cm3": 1.200000e-03},
+            {"hu":  -999, "density_g_cm3": 1.210000e-03},
+            {"hu":  -200, "density_g_cm3": 8.043754e-01},
+            {"hu":  -199, "density_g_cm3": 8.183035e-01},
+            {"hu":   -10, "density_g_cm3": 1.006579e+00},
+            {"hu":    -9, "density_g_cm3": 9.966749e-01},
+            {"hu":   120, "density_g_cm3": 1.126553e+00},
+            {"hu":   121, "density_g_cm3": 1.095097e+00},
+            {"hu":  3000, "density_g_cm3": 3.027294e+00},
+            {"hu":  4000, "density_g_cm3": 3.698428e+00}
+        ]
+    }
+
+    hu_values = [entry["hu"] for entry in hu_ed_curve["entries"]]
+    density_values = [entry["density_g_cm3"] for entry in hu_ed_curve["entries"]]
 
     ct_ed_arr = np.interp(ct_hu_arr, hu_values, density_values)
     return ct_ed_arr

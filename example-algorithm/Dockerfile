@@ -10,6 +10,7 @@ WORKDIR /opt/app
 
 COPY --chown=user:user app.py /opt/app/
 COPY --chown=user:user requirements.txt /opt/app/
+COPY --chown=user:user unet.py /opt/app/  
 
 # You can add any Python dependencies to requirements.txt
 RUN python -m pip install \
