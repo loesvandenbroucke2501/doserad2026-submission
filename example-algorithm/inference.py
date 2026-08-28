@@ -32,8 +32,7 @@ import SimpleITK as sitk
 import torch
 import torch.nn.functional as F 
 
-import matplotlib.pyplot as plt
-
+from geometry_encoding import MachineToPatientSpace
 
 INPUT_PATH = Path("/input")
 OUTPUT_PATH = Path("/output")
@@ -98,8 +97,12 @@ def run(model):
 
         # Every slice in a stack shares the same source image.
         input_image = load_input_by_index(slot[0]["input_file_idx"]) # ct images (sitk Image)
+        input_image_grid = sitk.GetArrayFromImage(input_image).shape # ct images (numpy array)
+        print(input_image_grid)
         ct_arr, ct_aff = convert_sitk_to_numpy(input_image) # ct images (numpy array, affine matrix)
         ct_arr, ct_aff = preprocess_ct(ct_arr, ct_aff)
+
+        print('Preprocessed CT')
 
         input_parameters = []
         input_parameters_index = []
@@ -109,16 +112,38 @@ def run(model):
                     for beam_idx, beam in enumerate(entry["beams"]):
                         for cp_idx, control_point in enumerate(beam["control_points"]):
                             if control_point["output_info"]["output_file_idx"] == output_index:
-                                
                                 input_parameters.append(
                                     project_mlc(entry, beam_idx, cp_idx, input_image)
                                 )            
                                 input_parameters_index.append(control_point["output_info"]["idx_in_output"])
                                 input_parameters_minimum_cutoff.append(control_point["output_info"]["minimum_cutoff"])
         
+        per_beam_doses = []
         for slice_index in range(stack_size):
-            ...
-       
+            '''
+            beam_dose = model(torch.cat(
+                    [torch.tensor(ct_arr, dtype=torch.float32).unsqueeze(0).to(device),
+                     torch.tensor(input_parameters[slice_index][0], dtype=torch.float32).unsqueeze(0).to(device)], 
+                     dim=0).unsqueeze(0) * 1e-5
+            )
+            '''
+            beam_dose = np.zeros(ct_arr.shape, dtype=np.float32)
+            beam_dose[beam_dose < input_parameters_minimum_cutoff[slice_index]] = 0
+            beam_dose = resize_image(beam_dose, np.eye(4), target_shape=input_image_grid)[0] # every dose output should have the same grid as the input image
+            per_beam_doses.append(beam_dose)
+        per_beam_doses_in_order = [per_beam_doses[i] for i in np.argsort(input_parameters_index)]
+
+        frames = []
+        for dose_array in per_beam_doses_in_order:
+            frame = sitk.GetImageFromArray(dose_array)
+            frame.CopyInformation(input_image)
+            frames.append(frame)
+
+        stacked = sitk.JoinSeries(frames)   # builds a 4D image
+        sitk.WriteImage(stacked, output_dir / 'dose.mha')
+
+        print('Wrote dose.mha')
+            
         '''
         print(
             f"Writing dummy dose stack for output file index {output_index + 1} "
@@ -139,144 +164,6 @@ def run(model):
         '''
 
     return 0
-
-class MachineToPatientSpace:
-
-    def __init__(self,
-                 machine_pixel_size_mm = [1,1], # mm
-                 patient_pixel_size_mm = [2, 2, 2], # mm
-                 sad_mm = 1000, # mm
-                 ):
-        
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.scale_factor = [machine_pixel_size_mm[0] / patient_pixel_size_mm[0], machine_pixel_size_mm[1] / patient_pixel_size_mm[2]]
-        self.sad_mm = sad_mm
-
-        self.patient_pixel_size_mm = patient_pixel_size_mm
-        self.machine_pixel_size_mm = machine_pixel_size_mm  
-    
-    def _resample_mlc(self, tensor, scale_factors):
-        return torch.nn.functional.interpolate(tensor, scale_factor = scale_factors, mode = 'bilinear')
-
-    def _backproject_scaling(self, mlc_tensor, iso, target_shape):
-
-        mlc_volume = torch.zeros((1, 1, target_shape[0], target_shape[1], target_shape[2]), dtype=torch.float32).to(self.device)
-
-        grid_y, grid_x = torch.meshgrid(
-            torch.linspace(-1, 1, mlc_tensor.shape[2], device=self.device),
-            torch.linspace(-1, 1, mlc_tensor.shape[3], device=self.device),
-            indexing="ij"
-        )
-        grid = torch.stack((grid_x, grid_y), dim=-1)[None, ...]
-
-        for y in range(target_shape[1]):
-
-            backproject_distance_mm = (iso[1] - y) * self.patient_pixel_size_mm[1]             
-        
-            scaling_factor = 1 / ((self.sad_mm - backproject_distance_mm) / self.sad_mm)
-            scaled_grid = grid * scaling_factor            
-
-            mlc_projected = F.grid_sample(mlc_tensor, scaled_grid, mode='bilinear', align_corners=True)
-            mlc_projected = mlc_projected.unsqueeze(3) 
-
-            # padding (isocenter is in center of the mlc aperture)
-            pad_x_left = iso[0] - mlc_projected.shape[2] // 2
-            pad_x_right = target_shape[0] - iso[0] - mlc_projected.shape[2] // 2 - (mlc_projected.shape[2] % 2)
-
-            crop_x_left = 0
-            crop_x_right = 0
-            if pad_x_left < 0:
-                crop_x_left = - pad_x_left
-                pad_x_left = 0
-            if pad_x_right < 0:
-                crop_x_right = - pad_x_right
-                pad_x_right = 0
-
-            pad_y_left = y
-            pad_y_right = target_shape[1] - y - 1
-
-            pad_z_left = iso[2] - mlc_projected.shape[4] // 2
-            pad_z_right = target_shape[2] - iso[2] - mlc_projected.shape[4] // 2 - (mlc_projected.shape[4] % 2)
-
-            crop_z_left = 0
-            crop_z_right = 0
-            if pad_z_left < 0:
-                crop_z_left = - pad_z_left
-                pad_z_left = 0
-            if pad_z_right < 0:
-                crop_z_right = - pad_z_right
-                pad_z_right = 0
-
-            mlc_projected = F.pad(mlc_projected, (pad_z_left, pad_z_right, pad_y_left, pad_y_right, pad_x_left, pad_x_right), mode='constant', value=0)
-            mlc_projected = mlc_projected[:, :, crop_x_left:mlc_projected.shape[2]-crop_x_right, :, crop_z_left:mlc_projected.shape[4]-crop_z_right]
-
-            if y == 0:
-                mlc_volume = mlc_projected
-            else:
-                mlc_volume = mlc_volume + mlc_projected
-
-        return mlc_volume
-
-    @staticmethod
-    def _apply_gantry_rotation(tensor, angle, isocenter_coo):
-
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-        _, _, W, H, D = tensor.shape
-
-        # shift the tensor so that the isocenter is at the center of rotation
-        shifts = (
-            W // 2 - isocenter_coo[0],
-            H // 2 - isocenter_coo[1],
-            D // 2 - isocenter_coo[2],
-        )
-        tensor = torch.roll(tensor, shifts=shifts, dims=(2, 3, 4))
-    
-        # create the rotation matrix for the gantry rotation around the isocenter (which is now the center of the tensor)
-        angle_rad = torch.tensor(angle * np.pi / 180, dtype=torch.float32).to(device)
-        gantry_rotation_matrix = torch.tensor([
-                [1, 0, 0, 0],
-                [0, torch.cos(angle_rad), -torch.sin(angle_rad), 0],
-                [0, torch.sin(angle_rad), torch.cos(angle_rad), 0],
-                ], device=device, dtype=torch.float32)
-
-        gantry_rotation_matrix = gantry_rotation_matrix.unsqueeze(0).repeat(tensor.shape[0], 1, 1)
-        gantry_grid = F.affine_grid(gantry_rotation_matrix, tensor.shape, align_corners=False)
-        tensor = F.grid_sample(tensor, gantry_grid, mode='bilinear', align_corners=False)
-
-        # shift the tensor back to the original position
-        shifts = (
-            W // 2 + isocenter_coo[0],
-            H // 2 + isocenter_coo[1],
-            D // 2 + isocenter_coo[2],
-        )
-        tensor = torch.roll(tensor, shifts=shifts, dims=(2, 3, 4))
- 
-        return tensor
-    
-    def process(self, mlc_aperture, gantry_angle, isocenter_wc, ct_arr, ct_aff):
-
-        iso = [int(np.round((isocenter_wc[i] - ct_aff[i, 3]) / ct_aff[i,i]))  for i in range(3)]
-
-        geo_enc = torch.zeros(ct_arr.shape, dtype = torch.float32).unsqueeze(0).unsqueeze(0).to(self.device)
-
-        mlc_aperture = torch.tensor(mlc_aperture, dtype=torch.float32).unsqueeze(0).unsqueeze(0).to(self.device)
-        
-        _, _, W, H, D = geo_enc.shape
-
-        mlc_aperture = self._resample_mlc(mlc_aperture, self.scale_factor)
-
-        geo_enc = self._backproject_scaling(mlc_aperture, iso, ct_arr.shape)
-    
-        geo_enc = self._apply_gantry_rotation(geo_enc, gantry_angle, iso)
-        geo_enc = geo_enc.squeeze().cpu().numpy()
-
-        body_mask = np.zeros_like(ct_arr, dtype=np.uint8)
-        body_mask[ct_arr != -1024] = 1
-
-        geo_enc = geo_enc * body_mask
-
-        return geo_enc 
 
 def project_mlc(beam_parameters, beam_idx, cp_idx, input_image):
 

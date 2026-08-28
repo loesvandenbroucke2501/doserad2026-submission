@@ -13,10 +13,10 @@ def load_model(model_dir, device):
         activation_final_layer = 'relu',
         norm = 'instance',
         residual = True)
-    model = model.to(device)
+    #model = model.to(device)
 
-    state_dict = torch.load(model_dir / 'model.pth', map_location=device)
-    model.load_state_dict(state_dict)
+    #state_dict = torch.load(model_dir / 'model.pth', map_location=device)
+    #model.load_state_dict(state_dict)
 
     return model
     
