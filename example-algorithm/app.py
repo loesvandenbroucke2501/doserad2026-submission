@@ -40,7 +40,7 @@ def init_model():
     # Example how to set torch to use the GPU (if available)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
-    model = torch.nn.Linear(10, 1).to(device)
+    #model = torch.nn.Linear(10, 1).to(device)
 
 
     # Your model will be extracted to the `model_dir` at runtime on Grand Challenge
@@ -48,13 +48,13 @@ def init_model():
     # Eventually, you should upload it as a tarball to Grand Challenge!
     # Go to Algorithm and upload it under Models.
     model_dir = Path("/opt/ml/model")
-    with open(
-        model_dir / "a_tarball_subdirectory" / "some_tarball_resource.txt", "r"
-        #model_dir / "model.pth"
-    ) as f:
-        print(f.read())
+#    with open(
+#        model_dir / "a_tarball_subdirectory" / "some_tarball_resource.txt", "r"
+#        #model_dir / "model.pth"
+#    ) as f:
+#        print(f.read())
 
-    #model = unet.load_model(model_dir, device=device)
+    model = unet.load_model(model_dir, device=device)
     return model
 
 

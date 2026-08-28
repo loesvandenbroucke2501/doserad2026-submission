@@ -209,7 +209,7 @@ start_container() {
   local docker_run_args=(
     --detach
     --name "$CONTAINER_NAME"
-   # --gpus all
+    --gpus all
     --platform=linux/amd64
     --volume "${SCRIPT_DIR}/example-algorithm/model":/opt/ml/model:ro
     --volume "$STAGING_INPUT_VOLUME":/input:ro

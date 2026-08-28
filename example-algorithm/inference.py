@@ -98,11 +98,8 @@ def run(model):
         # Every slice in a stack shares the same source image.
         input_image = load_input_by_index(slot[0]["input_file_idx"]) # ct images (sitk Image)
         input_image_grid = sitk.GetArrayFromImage(input_image).shape # ct images (numpy array)
-        print(input_image_grid)
         ct_arr, ct_aff = convert_sitk_to_numpy(input_image) # ct images (numpy array, affine matrix)
         ct_arr, ct_aff = preprocess_ct(ct_arr, ct_aff)
-
-        print('Preprocessed CT')
 
         input_parameters = []
         input_parameters_index = []
@@ -120,14 +117,12 @@ def run(model):
         
         per_beam_doses = []
         for slice_index in range(stack_size):
-            '''
             beam_dose = model(torch.cat(
                     [torch.tensor(ct_arr, dtype=torch.float32).unsqueeze(0).to(device),
                      torch.tensor(input_parameters[slice_index][0], dtype=torch.float32).unsqueeze(0).to(device)], 
                      dim=0).unsqueeze(0) * 1e-5
             )
-            '''
-            beam_dose = np.zeros(ct_arr.shape, dtype=np.float32)
+            #beam_dose = np.zeros(ct_arr.shape, dtype=np.float32)
             beam_dose[beam_dose < input_parameters_minimum_cutoff[slice_index]] = 0
             beam_dose = resize_image(beam_dose, np.eye(4), target_shape=input_image_grid)[0] # every dose output should have the same grid as the input image
             per_beam_doses.append(beam_dose)
@@ -141,9 +136,7 @@ def run(model):
 
         stacked = sitk.JoinSeries(frames)   # builds a 4D image
         sitk.WriteImage(stacked, output_dir / 'dose.mha')
-
-        print('Wrote dose.mha')
-            
+      
         '''
         print(
             f"Writing dummy dose stack for output file index {output_index + 1} "
